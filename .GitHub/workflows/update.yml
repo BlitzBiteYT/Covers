@@ -1,0 +1,95 @@
+# .github/workflows/update.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Anime Cover Database — Daily Sync
+#
+# Runs every day at 06:00 UTC (adjust cron as needed).
+# Can also be triggered manually from the Actions tab.
+#
+# Required repo setting:
+#   Settings → Actions → General → Workflow permissions
+#   → "Read and write permissions"  (so the bot can commit database.json)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Update Anime Cover Database
+
+on:
+  schedule:
+    # 06:00 UTC daily  (cron syntax: minute hour dom month dow)
+    - cron: "0 6 * * *"
+
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+# Grant the GITHUB_TOKEN permission to push commits
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync & Commit database.json
+    runs-on: ubuntu-latest
+    timeout-minutes: 30        # Safety net — scraper should finish in < 15 min
+
+    steps:
+      # ── 1. Checkout the repository ──────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch the full history so the commit graph is intact
+          fetch-depth: 1
+
+      # ── 2. Set up Python ────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # ── 3. Install dependencies ─────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      # ── 4. Run the scraper ──────────────────────────────────────────────────
+      - name: Run scraper.py
+        run: python scraper.py
+        env:
+          # Explicitly set UTF-8 so JSON with Japanese/Chinese titles saves cleanly
+          PYTHONIOENCODING: utf-8
+
+      # ── 5. Check whether database.json actually changed ─────────────────────
+      - name: Check for changes
+        id: changes
+        run: |
+          git diff --quiet database.json && echo "changed=false" >> $GITHUB_OUTPUT \
+            || echo "changed=true" >> $GITHUB_OUTPUT
+
+      # ── 6. Commit & push only when there are real changes ───────────────────
+      - name: Commit updated database
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add database.json
+
+          # Include the UTC timestamp and entry count in the commit message
+          ENTRY_COUNT=$(python - <<'EOF'
+          import json
+          try:
+              data = json.load(open("database.json"))
+              print(len(data) if isinstance(data, list) else len(data))
+          except Exception:
+              print("?")
+          EOF
+          )
+          TIMESTAMP=$(date -u "+%Y-%m-%d %H:%M UTC")
+
+          git commit -m "chore(db): sync anime covers — ${ENTRY_COUNT} entries [${TIMESTAMP}]"
+          git push
+
+      # ── 7. Skip message when nothing changed ────────────────────────────────
+      - name: No changes detected
+        if: steps.changes.outputs.changed == 'false'
+        run: echo "database.json is already up-to-date. Nothing to commit."
