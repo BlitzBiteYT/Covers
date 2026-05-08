@@ -62,11 +62,17 @@ jobs:
         run: python scraper.py
 
       # ── 5. Check whether database.json actually changed ─────────────────────
+      # IMPORTANT: git diff only detects changes to already-tracked files.
+      # A brand-new database.json shows as "untracked", not a diff.
+      # git status --porcelain catches both new files AND modifications.
       - name: Check for changes
         id: changes
         run: |
-          git diff --quiet database.json && echo "changed=false" >> $GITHUB_OUTPUT \
-            || echo "changed=true" >> $GITHUB_OUTPUT
+          if [ -n "$(git status --porcelain database.json)" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
 
       # ── 6. Commit & push only when there are real changes ───────────────────
       - name: Commit updated database
