@@ -14,8 +14,7 @@ name: Update Anime Cover Database
 
 on:
   schedule:
-    # 06:00 UTC daily  (cron syntax: minute hour dom month dow)
-    - cron: "0 6 * * *"
+        - cron: "*/15 * * * *"
 
   # Allow manual trigger from the Actions tab
   workflow_dispatch:
