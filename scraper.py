@@ -26,8 +26,13 @@ ANILIST_URL   = "https://graphql.anilist.co"
 # Seconds to sleep between Jikan calls (their public limit is ~3 req/s).
 JIKAN_SLEEP   = 1.5
 
-# AniList allows 90 req/min on public access — 0.67 s/req is safe.
-ANILIST_SLEEP = 0.7
+# AniList: stay well under the 90 req/min ceiling.
+# 1.5s per call = 40 req/min — comfortable headroom for 159-entry seasons.
+ANILIST_SLEEP = 1.5
+
+# How many times to retry a 429 before giving up, and base backoff in seconds.
+ANILIST_RETRY_LIMIT = 3
+ANILIST_RETRY_BACKOFF = 10  # doubles each attempt: 10s, 20s, 40s
 
 
 # ──────────────────────────────────────────────
@@ -206,19 +211,35 @@ query ($season: MediaSeason, $seasonYear: Int, $page: Int) {
 
 
 def _anilist_post(query: str, variables: dict) -> dict | None:
-    """Raw POST to AniList GraphQL endpoint. Returns parsed JSON or None."""
-    try:
-        resp = requests.post(
-            ANILIST_URL,
-            json={"query": query, "variables": variables},
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as exc:
-        print(f"[AniList] Request error: {exc}")
-        return None
+    """
+    Raw POST to AniList GraphQL endpoint.
+    Retries up to ANILIST_RETRY_LIMIT times on HTTP 429 with exponential backoff.
+    Returns parsed JSON or None.
+    """
+    backoff = ANILIST_RETRY_BACKOFF
+    for attempt in range(1, ANILIST_RETRY_LIMIT + 2):  # +2 = initial try + retries
+        try:
+            resp = requests.post(
+                ANILIST_URL,
+                json={"query": query, "variables": variables},
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                if attempt <= ANILIST_RETRY_LIMIT:
+                    print(f"[AniList] 429 rate limit — waiting {backoff}s before retry {attempt}/{ANILIST_RETRY_LIMIT} …")
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                else:
+                    print(f"[AniList] 429 rate limit — retry limit reached, skipping.")
+                    return None
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as exc:
+            print(f"[AniList] Request error: {exc}")
+            return None
+    return None
 
 
 def search_anilist_by_title(title: str) -> dict | None:
