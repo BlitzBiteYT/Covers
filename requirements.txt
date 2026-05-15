@@ -1,0 +1,4 @@
+# anipy-seasonal-streams — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+anipy-api>=3.8.8
