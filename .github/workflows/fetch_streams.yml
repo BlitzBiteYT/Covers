@@ -1,0 +1,222 @@
+name: Fetch Seasonal Anime Streams
+
+on:
+  # ── Manual trigger (main use-case) ─────────────────────────────────────────
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "Anime season"
+        required: true
+        type: choice
+        options: [SPRING, SUMMER, FALL, WINTER]
+        default: FALL
+
+      year:
+        description: "Year (e.g. 2024)"
+        required: true
+        type: string
+        default: "2024"
+
+      lang:
+        description: "Preferred language"
+        required: true
+        type: choice
+        options: [sub, dub]
+        default: sub
+
+      ep_limit:
+        description: "Max episodes per anime (leave blank = all)"
+        required: false
+        type: string
+        default: ""
+
+      anime_limit:
+        description: "Max anime titles to process (leave blank = all)"
+        required: false
+        type: string
+        default: ""
+
+  # ── Scheduled runs: fetch each current season on the 1st of every month ───
+  # Adjust or remove these cron entries to taste.
+  schedule:
+    # 1 Jan  → WINTER
+    - cron: "0 4 1 1 *"
+    # 1 Apr  → SPRING
+    - cron: "0 4 1 4 *"
+    # 1 Jul  → SUMMER
+    - cron: "0 4 1 7 *"
+    # 1 Oct  → FALL
+    - cron: "0 4 1 10 *"
+
+# Allow one run at a time per season to avoid hitting provider rate limits
+concurrency:
+  group: fetch-${{ github.event.inputs.season || 'scheduled' }}-${{ github.event.inputs.year || '' }}
+  cancel-in-progress: false
+
+jobs:
+  fetch-streams:
+    name: "Fetch ${{ github.event.inputs.season || 'scheduled' }} ${{ github.event.inputs.year || '' }} streams"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # large seasonal runs can take a while
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 3. Install dependencies ─────────────────────────────────────────────
+      - name: Install anipy-api and dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Resolve season + year for scheduled runs ─────────────────────────
+      #       For scheduled triggers, derive season from the current month;
+      #       for manual triggers, use the supplied inputs.
+      - name: Resolve season and year
+        id: resolve
+        shell: python
+        run: |
+          import os, datetime
+
+          # Inputs from workflow_dispatch (empty string when running on schedule)
+          season_input = "${{ github.event.inputs.season }}".strip()
+          year_input   = "${{ github.event.inputs.year }}".strip()
+          lang_input   = "${{ github.event.inputs.lang }}".strip() or "sub"
+          ep_limit     = "${{ github.event.inputs.ep_limit }}".strip()
+          anime_limit  = "${{ github.event.inputs.anime_limit }}".strip()
+
+          if season_input:
+              season = season_input
+              year   = year_input or str(datetime.date.today().year)
+          else:
+              # Scheduled: derive from current month
+              month = datetime.date.today().month
+              season_map = {1:"WINTER",2:"WINTER",3:"WINTER",
+                            4:"SPRING",5:"SPRING",6:"SPRING",
+                            7:"SUMMER",8:"SUMMER",9:"SUMMER",
+                            10:"FALL",11:"FALL",12:"FALL"}
+              season = season_map[month]
+              year   = str(datetime.date.today().year)
+
+          output_file = f"output/streams_{season}_{year}_{lang_input}.json"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"season={season}\n")
+              fh.write(f"year={year}\n")
+              fh.write(f"lang={lang_input}\n")
+              fh.write(f"ep_limit={ep_limit}\n")
+              fh.write(f"anime_limit={anime_limit}\n")
+              fh.write(f"output_file={output_file}\n")
+              fh.write(f"artifact_name=streams-{season}-{year}-{lang_input}\n")
+
+      # ── 5. Fetch streams ─────────────────────────────────────────────────────
+      - name: Fetch streaming links
+        run: |
+          EXTRA_ARGS=""
+          if [ -n "${{ steps.resolve.outputs.ep_limit }}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --ep-limit ${{ steps.resolve.outputs.ep_limit }}"
+          fi
+          if [ -n "${{ steps.resolve.outputs.anime_limit }}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --anime-limit ${{ steps.resolve.outputs.anime_limit }}"
+          fi
+
+          python get_streams.py \
+            --season   "${{ steps.resolve.outputs.season }}" \
+            --year     "${{ steps.resolve.outputs.year }}" \
+            --lang     "${{ steps.resolve.outputs.lang }}" \
+            --output   "${{ steps.resolve.outputs.output_file }}" \
+            $EXTRA_ARGS
+
+      # ── 6. Generate a human-readable summary ─────────────────────────────────
+      - name: Generate markdown summary
+        shell: python
+        run: |
+          import json, pathlib, os
+
+          data_path = pathlib.Path("${{ steps.resolve.outputs.output_file }}")
+          if not data_path.exists():
+              print("Output file not found — skipping summary.")
+              raise SystemExit(0)
+
+          data   = json.loads(data_path.read_text())
+          meta   = data["meta"]
+          anime  = data["anime"]
+
+          total_eps     = sum(len(a["episodes"]) for a in anime)
+          total_streams = sum(
+              len(ep["streams"])
+              for a in anime
+              for ep in a["episodes"]
+          )
+
+          lines = [
+              f"## 📺 {meta['season']} {meta['year']} Streams — {meta['lang'].upper()}",
+              "",
+              f"| Stat | Value |",
+              f"|------|-------|",
+              f"| Titles processed | **{len(anime)}** |",
+              f"| Total episodes   | **{total_eps}** |",
+              f"| Total stream URLs| **{total_streams}** |",
+              f"| Provider         | `{meta['provider']}` |",
+              f"| Generated at     | `{meta['generated_at']}` |",
+              "",
+              "### Anime Breakdown",
+              "",
+              "| # | Title | Episodes | Languages | Qualities (first ep) |",
+              "|---|-------|----------|-----------|----------------------|",
+          ]
+
+          for i, a in enumerate(anime, 1):
+              ep_count = len(a["episodes"])
+              langs    = ", ".join(a.get("languages", []))
+              # sample qualities from first available episode
+              qualities = ""
+              if a["episodes"] and a["episodes"][0]["streams"]:
+                  qualities = " / ".join(
+                      s["quality"] for s in a["episodes"][0]["streams"]
+                  )
+              lines.append(
+                  f"| {i} | {a['name']} | {ep_count} | {langs} | {qualities} |"
+              )
+
+          summary = "\n".join(lines)
+
+          # Write to GitHub Step Summary
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+          with open(summary_path, "w") as fh:
+              fh.write(summary)
+
+          # Also save a copy
+          pathlib.Path("output/summary.md").write_text(summary)
+          print(summary)
+
+      # ── 7. Upload artifact ────────────────────────────────────────────────────
+      - name: Upload streams JSON as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.resolve.outputs.artifact_name }}
+          path: output/
+          retention-days: 90   # keep for 90 days
+
+      # ── 8. (Optional) Commit results to repository ────────────────────────────
+      # Uncomment the block below if you want results committed back to the repo
+      # on the 'results' branch. Requires write permission in repo settings.
+      #
+      # - name: Commit results to results branch
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   run: |
+      #     git config user.name  "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git fetch origin results 2>/dev/null || git checkout --orphan results
+      #     git checkout results 2>/dev/null || true
+      #     mkdir -p output
+      #     git add output/
+      #     git diff --cached --quiet || git commit -m "chore: streams ${{ steps.resolve.outputs.season }} ${{ steps.resolve.outputs.year }}"
+      #     git push origin results
